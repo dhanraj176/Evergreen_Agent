@@ -9,7 +9,7 @@ Evergreen upgrades a codebase one file at a time and turns every fix it can prov
 - Dashboard code: https://github.com/Nakul-Shivaraj/Evergreen-LHAH
 - Demo target repo: https://github.com/dhanraj176/sales-report
 - Pull request opened by Evergreen (run test3, 3 to 21/21 tests): https://github.com/dhanraj176/sales-report/pull/3
-- Demo video: VIDEO_URL
+- Demo video: https://www.youtube.com/watch?v=yx02GGgPadc&feature=youtu.be
 
 ## 1. What Evergreen is
 
