@@ -9,9 +9,11 @@ return the source unchanged with an explanation starting "invalid edits:".
 
 Rules are built here, not proposed by the model: each edit on a failure's line gives a rule with
 pattern = the original line, replacement = the edited line, signature = that failure's signature.
-One short call (thinking off) proposes regex_find/regex_replace; the regex is kept only if applying
-it to the original line reproduces the edited line exactly. new_rule is the first such rule;
-result.new_rules lists all of them (one per signature).
+regex_find/regex_replace come from the smallest span that differs between the two lines, widened to
+identifier boundaries, and are kept only if re.sub on the original line reproduces the edited line.
+new_rule is the first such rule; new_rules lists all of them (one per signature).
+
+think=True lets the model reason before answering (slow); think=False constrains from token 1 (fast).
 """
 import json
 import os
@@ -23,7 +25,7 @@ import requests
 from evergreen.schema import Evidence, PatchResult, Rule
 
 SAMPLING = {"temperature": 0.2, "top_k": 80, "repeat_penalty": 1.05}
-MAX_OUTPUT_TOKENS = 2048
+MAX_OUTPUT_TOKENS = 4096     # thinking mode reasons first; 2048 cut answers off mid-JSON
 
 PATCH_SCHEMA = {
     "type": "object",
@@ -49,17 +51,10 @@ SYSTEM_PROMPT = (
     "of the file as shown, including its indentation and without the 'N| ' prefix. It may hold "
     "several lines separated by \\n. An empty new_text deletes the line.")
 
-REGEX_SYSTEM = (
-    "You write Python regular expressions for one-line code fixes. For each item give regex_find "
-    "and regex_replace so that re.sub(regex_find, regex_replace, before) == after exactly, matching "
-    "only the changed code so the same fix works on other lines. Escape regex metacharacters such as "
-    "( ) . [ ] ? * +. Use groups like \\1 for parts that vary. Answer in JSON.")
-
-
-def patch(path, source, failures, hints, feedback) -> PatchResult:
+def patch(path, source, failures, hints, feedback, think=True) -> PatchResult:
     hints = list(hints or []) + [None] * (len(failures) - len(hints or []))
     user = build_prompt(path, source, failures, hints, feedback)
-    out, prompt_tokens, output_tokens = _call(SYSTEM_PROMPT, user, PATCH_SCHEMA, think=True)
+    out, prompt_tokens, output_tokens = _call(SYSTEM_PROMPT, user, PATCH_SCHEMA, think=think)
     try:
         answer = json.loads(out) if isinstance(out, str) else out
         edits = answer["edits"]
@@ -70,11 +65,9 @@ def patch(path, source, failures, hints, feedback) -> PatchResult:
     mapped, error = _edit_map(source, edits)
     if error:
         return PatchResult(source, f"invalid edits: {error}", None, prompt_tokens, output_tokens)
-    rules, rule_tokens = build_rules(source, mapped, failures, hints)
-    result = PatchResult(_join(source, mapped), explanation, rules[0] if rules else None,
-                         prompt_tokens + rule_tokens[0], output_tokens + rule_tokens[1])
-    result.new_rules = rules
-    return result
+    rules = build_rules(source, mapped, failures, hints)
+    return PatchResult(_join(source, mapped), explanation, rules[0] if rules else None,
+                       prompt_tokens, output_tokens, new_rules=rules)
 
 
 def numbered(source: str) -> str:
@@ -132,11 +125,20 @@ def _edit_map(source: str, edits) -> tuple[dict[int, list[str]], str | None]:
         text = e["new_text"].replace("\r", "").rstrip("\n")
         new = [re.sub(rf"^ *{n}\| ", "", t, count=1) if i == 0 else t
                for i, t in enumerate(text.split("\n"))] if text.strip() else []
-        indent = lines[n - 1][:len(lines[n - 1]) - len(lines[n - 1].lstrip())]
-        if new and indent and not new[0][:1].isspace():   # model dropped the indentation: restore it
-            new = [indent + t if t.strip() else t for t in new]
-        mapped[n] = new
+        mapped[n] = _reindent(lines[n - 1], new)
     return mapped, None
+
+
+def _reindent(original: str, new: list[str]) -> list[str]:
+    """Keep the replaced line's indentation. The model often drops or shifts it (r2: "expected an
+    indented block"); later lines of a multi-line edit keep their indentation relative to the first."""
+    if not new or not original.strip():
+        return new
+    indent = original[:len(original) - len(original.lstrip())]
+    shift = len(new[0]) - len(new[0].lstrip())
+    if new[0][:shift] == indent:
+        return new
+    return [indent + t[min(shift, len(t) - len(t.lstrip())):] if t.strip() else t for t in new]
 
 
 def _join(source: str, mapped: dict[int, list[str]]) -> str:
@@ -153,7 +155,7 @@ def apply_edits(source: str, edits) -> tuple[str, str | None]:
     return (source, error) if error else (_join(source, mapped), None)
 
 
-def build_rules(source, mapped, failures, hints) -> tuple[list[dict], tuple[int, int]]:
+def build_rules(source, mapped, failures, hints) -> list[dict]:
     """One rule per signature from the edits on failing lines; regexes kept only if they validate."""
     lines = _split(source)[0]
     rules, seen = [], set()
@@ -163,18 +165,10 @@ def build_rules(source, mapped, failures, hints) -> tuple[list[dict], tuple[int,
         if not new or f.signature in seen or after == before:
             continue
         seen.add(f.signature)
+        find, repl = span_regex(before, after)
         rules.append({"signature": f.signature, "pattern": before.strip(), "replacement": after.strip(),
-                      "regex_find": None, "regex_replace": None, "source_url": _source_url(h),
-                      "_before": before, "_after": after})
-    tokens = (0, 0)
-    if rules:
-        try:
-            tokens = _add_regexes(rules)
-        except (requests.RequestException, ValueError, KeyError, TypeError):
-            pass                               # the rule stays a hint without an instant transform
-    for r in rules:
-        del r["_before"], r["_after"]
-    return rules, tokens
+                      "regex_find": find, "regex_replace": repl, "source_url": _source_url(h)})
+    return rules
 
 
 def _source_url(hint):
@@ -183,29 +177,43 @@ def _source_url(hint):
     return hint.source_url if isinstance(hint, Rule) else None
 
 
-def _add_regexes(rules) -> tuple[int, int]:
-    n = len(rules)
-    schema = {"type": "object", "required": ["regexes"], "additionalProperties": False, "properties": {
-        "regexes": {"type": "array", "minItems": n, "maxItems": n, "items": {
-            "type": "object", "required": ["regex_find", "regex_replace"], "additionalProperties": False,
-            "properties": {"regex_find": {"type": "string"}, "regex_replace": {"type": "string"}}}}}}
-    user = "\n".join(f"{i}. {r['signature']}\n   before: {r['_before'].strip()}\n   after: {r['_after'].strip()}"
-                     for i, r in enumerate(rules, 1))
-    out, prompt_tokens, output_tokens = _call(REGEX_SYSTEM, user, schema, think=False)
-    answer = json.loads(out) if isinstance(out, str) else out
-    for r, rx in zip(rules, answer["regexes"]):
-        if _regex_ok(rx.get("regex_find"), rx.get("regex_replace"), r["_before"], r["_after"]):
-            r["regex_find"], r["regex_replace"] = rx["regex_find"], rx["regex_replace"]
-    return prompt_tokens, output_tokens
+def _word(ch: str) -> bool:
+    return ch.isalnum() or ch == "_"
 
 
-def _regex_ok(find, repl, before, after) -> bool:
-    if not find or not isinstance(repl, str):
-        return False
+def span_regex(before: str, after: str) -> tuple[str | None, str | None]:
+    """(regex_find, regex_replace) for the changed span, or (None, None) if it doesn't reproduce `after`.
+
+    "df.iteritems()" -> "df.items()" gives (r"\\biteritems\\b", "items"). A pure insertion such as
+    ".mean()" -> ".mean(numeric_only=True)" has no old text of its own, so the span takes in the
+    identifier to its left: (r"\\bmean\\(", "mean(numeric_only=True").
+    """
+    n = min(len(before), len(after))
+    p = 0
+    while p < n and before[p] == after[p]:
+        p += 1
+    s = 0
+    while s < n - p and before[-1 - s] == after[-1 - s]:
+        s += 1
+    while p > 0 and _word(before[p - 1]):                  # widen to identifier boundaries
+        p -= 1
+    while s > 0 and _word(before[len(before) - s]):
+        s -= 1
+    if p == len(before) - s:                               # nothing removed: anchor on the identifier to the left
+        while p > 0 and not _word(before[p - 1]) and not before[p - 1].isspace():
+            p -= 1
+        while p > 0 and _word(before[p - 1]):
+            p -= 1
+    old, new = before[p:len(before) - s], after[p:len(after) - s]
+    if not old.strip():
+        return None, None
+    find = (r"\b" if _word(old[0]) else "") + re.escape(old) + (r"\b" if _word(old[-1]) else "")
+    repl = new.replace("\\", "\\\\")
     try:
-        return re.sub(find, repl, before) == after
+        ok = re.sub(find, repl, before) == after
     except (re.error, IndexError):
-        return False
+        ok = False
+    return (find, repl) if ok else (None, None)
 
 
 def _call(system: str, user: str, schema: dict, think: bool):
@@ -227,7 +235,7 @@ def _call_liquid(system, user, schema, think):
     r = requests.post(f"{url}/v1/chat/completions", timeout=300, json={
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         "response_format": {"type": "json_schema", "json_schema": {"name": "submit_patch", "schema": schema}},
-        "max_tokens": MAX_OUTPUT_TOKENS if think else 512, **SAMPLING,
+        "max_tokens": MAX_OUTPUT_TOKENS, **SAMPLING,
         **({} if think else {"reasoning_format": "none"})})
     r.raise_for_status()
     j = r.json()

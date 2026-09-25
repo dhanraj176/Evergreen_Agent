@@ -51,3 +51,4 @@ class PatchResult:
     new_rule: dict | None
     prompt_tokens: int
     output_tokens: int
+    new_rules: list[dict] = field(default_factory=list)   # one per signature; new_rule is the first

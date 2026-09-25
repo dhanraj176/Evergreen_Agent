@@ -60,6 +60,15 @@ def push(repo, branch: str = BRANCH, remote: str = "origin") -> None:
     git(repo, "push", "-q", "-u", remote, branch)
 
 
+def pr_for_branch(repo, branch: str = BRANCH) -> str | None:
+    """URL of the open PR from `branch`, or None."""
+    try:
+        return _run(["gh", "pr", "list", "--head", branch, "--state", "open", "--json", "url",
+                     "--jq", ".[0].url // empty"], cwd=repo) or None
+    except RuntimeError:
+        return None
+
+
 def open_pr(repo, title: str, body: str, base: str = "main", head: str | None = None) -> str:
     """`gh pr create` from `head` (default: current branch) into `base`. Returns the PR URL."""
     fd, body_file = tempfile.mkstemp(suffix=".md", prefix="evergreen-pr-")

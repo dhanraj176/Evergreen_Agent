@@ -14,13 +14,14 @@ def main() -> int:
     ap.add_argument("--venv", required=True, help="venv the target's tests run in, e.g. ../sales-report/.venv-new")
     ap.add_argument("--run-id", required=True, help="label for this run in the logs, e.g. r1")
     ap.add_argument("--no-rules", action="store_true", help="ablation: treat every error as new, reuse no rules")
+    ap.add_argument("--no-pr", action="store_true", help="commit locally only: don't push the branch or open a PR")
     args = ap.parse_args()
 
     from dotenv import load_dotenv
     load_dotenv(encoding="utf-8")
 
     from evergreen.loop import run
-    return run(args.repo, args.venv, args.run_id, use_rules=not args.no_rules)
+    return run(args.repo, args.venv, args.run_id, use_rules=not args.no_rules, pr=not args.no_pr)
 
 
 if __name__ == "__main__":
