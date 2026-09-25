@@ -200,6 +200,75 @@ def log_tests(run_id: str, tests: TestRun, suite: int, attempt: int | None, file
                              "line_no": f.line_no})
 
 
+def run_rules(run_id: str) -> tuple[list[Rule], str]:
+    """A finished run's rulebook: the latest rule_events row per rule_id, kept if it is verified or
+    trusted. From RawTree; else runs/<run_id>/summary.json; else runs/<run_id>.jsonl.
+    Returns (rules, where they came from). Ties on (at, seq) resolve towards demoted/retired."""
+    if not re.fullmatch(r"[\w.-]{1,64}", run_id):
+        raise ValueError(f"bad run id {run_id!r}")
+    events, where = [], ""
+    if os.environ.get("RAWTREE_API_KEY"):
+        try:
+            r = requests.post(f"{API}/v1/query", headers=_headers(), timeout=15, data=_dumps(
+                {"sql": f"SELECT __raw_data AS d FROM rule_events WHERE run_id = '{run_id}'"}).encode("utf-8"))
+            r.raise_for_status()
+            events = [json.loads(x["d"]) if isinstance(x["d"], str) else x["d"] for x in r.json().get("data", [])]
+            where = "RawTree"
+        except (requests.RequestException, ValueError, KeyError) as e:
+            stats["last_error"] = f"run_rules: {e}"
+    if not events and (RUNS / run_id / "summary.json").exists():
+        summary = json.loads((RUNS / run_id / "summary.json").read_text(encoding="utf-8"))
+        return _usable(summary.get("rules", [])), f"runs/{run_id}/summary.json"
+    if not events and _run_file(run_id).exists():
+        events = [r for r in _local_rows_of(_run_file(run_id)) if r.get("_table") == "rule_events"]
+        where = f"runs/{run_id}.jsonl"
+    latest: dict[str, list[dict]] = {}
+    for e in events:
+        if e.get("event") == "loaded":
+            continue
+        key = (e.get("at", 0), e.get("seq", -1))
+        best = latest.get(e["rule_id"])
+        if best is None or key > best[0]:
+            latest[e["rule_id"]] = [key, e]
+        elif key == best[0]:
+            best.append(e)
+    finals = []
+    for _, *tied in latest.values():
+        bad = next((e for e in tied if e.get("status") in ("demoted", "retired")), None)
+        finals.append(bad or tied[0])
+    return _usable(finals), where
+
+
+def _usable(rows: list[dict]) -> list[Rule]:
+    names = {f.name for f in fields(Rule)}
+    rules = [Rule(**{k: v for k, v in r.items() if k in names}) for r in rows
+             if r.get("status") in ("verified", "trusted")]
+    for r in rules:
+        if isinstance(r.proven_on, str):
+            r.proven_on = json.loads(r.proven_on)
+        if isinstance(r.proof, str):
+            r.proof = json.loads(r.proof)
+    return sorted(rules, key=lambda r: [int(p) if p.isdigit() else p for p in re.split(r"(\d+)", r.rule_id)])
+
+
+def _local_rows_of(path: Path) -> list[dict]:
+    rows = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                continue
+    return rows
+
+
+def log_rule_loaded(run_id: str, rule: Rule, source_run: str, source: str) -> None:
+    """rule_events row for a rule carried in from an earlier run (--memory-from)."""
+    log("rule_events", {"run_id": run_id, "rule_id": rule.rule_id, "event": "loaded",
+                        **{k: v for k, v in asdict(rule).items() if k != "rule_id"},
+                        "confidence": round(confidence(rule), 2), "source_run": source_run, "source": source})
+
+
 def _rules_file() -> Path:
     return RUNS / "rules.json"
 

@@ -141,6 +141,7 @@ This checks that `sales-report` has no uncommitted changes and creates the branc
 
 - `--no-pr` commits locally but doesn't push or open a PR.
 - `--no-rules` is the ablation run: every error is treated as new, so each file looks its errors up again and no rule is reused.
+- `--memory-from <run_id>` is a warm start: the run begins with that run's verified and trusted rules (from RawTree, or `runs/<run_id>/` locally), so known errors skip the web lookup and are fixed instantly or in fast mode. Every guard, the ratchet and the golden check still apply.
 
 To rehearse again:
 

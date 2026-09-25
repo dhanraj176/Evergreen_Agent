@@ -23,7 +23,8 @@ from evergreen.gitops import BRANCH, commit_file, create_branch, git, open_pr, p
 from evergreen.golden import golden_broken, golden_ok
 from evergreen.guards import patch_ok, tests_hash
 from evergreen.instant import apply_instant
-from evergreen.memory import flush, log, log_patch, log_tests, save_rule_event, trusted
+from evergreen.memory import (flush, log, log_patch, log_rule_loaded, log_tests, run_rules, save_rule_event,
+                              trusted)
 from evergreen.patcher import patch
 from evergreen.schema import Failure, PatchResult, Rule, TestRun
 from evergreen.testrun import run_tests, venv_python
@@ -57,6 +58,8 @@ class State:
     attempt_no: int = 0
     history_tokens: int = 0       # prompt + output of every earlier attempt (section 10)
     suite: int = 0                # full test-suite runs so far (test_results.suite)
+    memory_from: str | None = None
+    baseline_s: float = 0.0       # baseline pytest + golden + pandas version
     needs_human: list[str] = field(default_factory=list)
     files: list[dict] = field(default_factory=list)
     timeline: list[dict] = field(default_factory=list)
@@ -73,18 +76,26 @@ class State:
 
 
 def run(repo: str, venv: str, run_id: str, use_rules: bool = True, files: list[str] | None = None,
-        pr: bool = True) -> int:
+        pr: bool = True, memory_from: str | None = None) -> int:
+    t_run = time.time()
     repo = Path(repo).resolve()
     if git(repo, "status", "--porcelain"):
         print(f"{repo} has uncommitted changes; restore them (or run reset.py) before a run.")
+        return 1
+    if memory_from and not use_rules:
+        print("--memory-from needs rules on; drop --no-rules.")
         return 1
     create_branch(repo, BRANCH)
     names = files or ORDER
     with Dashboard(run_id, repo=repo.name, mode="rules on" if use_rules else "rules off", files=names) as dash:
         dash.log(f"branch {BRANCH} in {repo.name}; running the test suite")
+        t0 = time.time()
         tests = run_tests(repo, venv)
         st = State(repo, venv, run_id, use_rules, dash, _library_version(venv), tests_hash(repo),
                    tests, golden_ok(repo, venv), len(tests.passing), _total(tests))
+        st.started, st.baseline_s = t_run, time.time() - t0
+        if memory_from:
+            _load_memory(st, memory_from)
         _log_suite(st, None)
         _log_tests(st, tests, None, None, kept=True)
         dash.update(tests_passing=len(tests.passing), tests_total=_total(tests))
@@ -94,6 +105,18 @@ def run(repo: str, venv: str, run_id: str, use_rules: bool = True, files: list[s
         finish(st, pr)
     results.print_table(st, dash.console)
     return 0 if not st.tests.failing else 1
+
+
+def _load_memory(st: State, source_run: str) -> None:
+    """--memory-from: start with another run's final verified/trusted rules, as trusted."""
+    rules, where = run_rules(source_run)
+    for rule in rules:
+        rule.status = "trusted"
+        log_rule_loaded(st.run_id, rule, source_run, where)
+    st.rules, st.memory_from = rules, source_run
+    st.dash.memory = f"memory: {len(rules)} rules from {source_run}"
+    st.dash.log(f"memory: {len(rules)} rules from {source_run} ({where or 'nothing found'}): "
+                + ", ".join(f"{r.rule_id} {r.signature}" for r in rules), style="bold magenta")
 
 
 def finish(st: State, pr: bool) -> None:
@@ -117,10 +140,12 @@ def finish(st: State, pr: bool) -> None:
             st.pr_url = pr_for_branch(st.repo, BRANCH)
             if not st.pr_url:
                 st.notes.append(f"{str(e)[:300]} (run reset.py, then try again)")
+    else:
+        st.notes.append("--no-pr: committed locally, not pushed")
     flush()
     path = results.write_summary(st)
     dash.log(f"summary: {path}")
-    dash.finish(st.pr_url, "\n".join(st.notes))
+    dash.finish(st.pr_url, "\n".join(st.notes), seconds=st.seconds)
 
 
 def fix_file(st: State, src: str) -> None:
@@ -221,9 +246,15 @@ def _fix_round(st: State, src: str, failures: list[Failure], entry: dict) -> boo
         accepted, after, gold = False, None, {}
         try:
             restore(path, res.new_source)
-            after = run_tests(st.repo, st.venv)
-            gold = golden_ok(st.repo, st.venv)
-            reason = _ratchet(st, after, gold, src)
+            t_tests = time.time()
+            after = run_tests(st.repo, st.venv)                # pytest once per attempt
+            row["tests_s"] = round(time.time() - t_tests, 2)
+            reason = _ratchet_tests(st, after)
+            if reason is None:                                 # golden only if the tests allow it
+                t_gold = time.time()
+                gold = golden_ok(st.repo, st.venv)
+                row["golden_s"] = round(time.time() - t_gold, 2)
+                reason = _ratchet_golden(st, gold)
             accepted = reason is None
         finally:
             if not accepted:
@@ -322,9 +353,8 @@ def _guard(original: str, res) -> tuple[bool, str]:
     return ok, why
 
 
-def _ratchet(st: State, after: TestRun, gold: dict, src: str) -> str | None:
-    """None if the patch may be kept, else the reason. Partial progress is kept: a golden case that
-    still errors is fine, but one that stops matching or gives wrong output is not."""
+def _ratchet_tests(st: State, after: TestRun) -> str | None:
+    """The test half of the ratchet: None if the suite allows keeping the patch, else the reason."""
     suite = next((f for f in after.failing if f.test_id == "<suite>"), None)
     if suite:
         return f"The test run itself failed: {suite.message}"
@@ -336,6 +366,12 @@ def _ratchet(st: State, after: TestRun, gold: dict, src: str) -> str | None:
         return "These tests passed before and fail now:\n" + _describe(lost)
     if len(after.passing) <= len(st.tests.passing):
         return "No new test passes."
+    return None
+
+
+def _ratchet_golden(st: State, gold: dict) -> str | None:
+    """The golden half. Partial progress is kept: a case that still errors is fine, but one that
+    stops matching or gives wrong output is not."""
     broken = golden_broken(st.golden, gold)
     if broken:
         return ("Outputs no longer match pandas 1.5 (golden check) for: "
@@ -410,7 +446,7 @@ def _learn(st: State, res, failures: list[Failure], after: TestRun) -> list[Rule
         if cand["signature"] in covered or not tests or not all(t in after.passing for t in tests):
             continue
         url = cand.get("source_url")
-        rule = Rule(rule_id=f"R{len(st.rules) + 1}", signature=cand["signature"], pattern=cand["pattern"],
+        rule = Rule(rule_id=_next_rule_id(st), signature=cand["signature"], pattern=cand["pattern"],
                     replacement=cand["replacement"], regex_find=cand.get("regex_find"),
                     regex_replace=cand.get("regex_replace"),
                     source_url=url if url in evidence.seen_urls else None,   # else "unsourced"
@@ -421,6 +457,11 @@ def _learn(st: State, res, failures: list[Failure], after: TestRun) -> list[Rule
         save_rule_event(st.run_id, rule, "verified")
         st.dash.learned(rule.rule_id, rule.signature, rule.source_url)
     return learned
+
+
+def _next_rule_id(st: State) -> str:
+    """R<n+1> after the highest id so far, so rules learned now never collide with loaded ones."""
+    return f"R{max((int(r.rule_id[1:]) for r in st.rules if r.rule_id[1:].isdigit()), default=0) + 1}"
 
 
 def _end_attempt(st: State, entry: dict, row: dict, t0: float, outcome: str, reason: str = "", **flags):

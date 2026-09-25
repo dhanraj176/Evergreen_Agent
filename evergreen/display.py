@@ -61,6 +61,7 @@ class Dashboard:
         self.log_lines = log_lines
         self.started = time.time()
         self.final = None
+        self.memory = ""               # e.g. "memory: 6 rules from live1", shown in the header
         self._live = None
 
     # ---- API -------------------------------------------------------------------------------
@@ -131,11 +132,13 @@ class Dashboard:
         if not self._live and status != "working":
             self.log(f"{name}: {status}" + (f" ({f['note']})" if f["note"] else ""))
 
-    def finish(self, pr_url: str | None = None, note: str = "") -> None:
+    def finish(self, pr_url: str | None = None, note: str = "", seconds: float | None = None) -> None:
         c = self.counts
         green = c["tests_total"] and c["tests_passing"] == c["tests_total"]
         body = Text(justify="center")
         body.append(f"{c['tests_passing']}/{c['tests_total']} tests passing", style="bold green" if green else "bold red")
+        if seconds is not None:
+            body.append(f"   in {_clock(seconds)} ({seconds:.0f} s)", style="bold")
         body.append("   " + self.dot.join([f"{c['rules_learned']} rules learned", f"{c['rules_applied']} applied",
                                            f"{c['web_lookups']} web lookups",
                                            f"{c['human_interventions']} human interventions"]) + "\n")
@@ -187,7 +190,8 @@ class Dashboard:
         row.add_column(vertical="middle")
         row.add_row(tests, grid)
         title = Text.assemble(("EVERGREEN", "bold green"),
-                              "  " + self.dot.join([self.repo, f"run {self.run_id}", self.mode, ""]),
+                              "  " + self.dot.join([self.repo, f"run {self.run_id}", self.mode]
+                                                   + ([self.memory] if self.memory else []) + [""]),
                               (_clock(time.time() - self.started), "bold"))
         return Panel(row, title=title, title_align="left", border_style=colour, padding=(0, 2))
 

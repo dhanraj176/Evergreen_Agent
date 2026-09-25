@@ -28,7 +28,7 @@ The plan is docs/BRIEF.md (gitignored). Read it in full before a new phase.
 
 ## Layout
 ```
-run.py                  CLI: --repo --venv --run-id [--no-rules] [--no-pr]; reset.py resets the target for a rehearsal
+run.py                  CLI: --repo --venv --run-id [--no-rules] [--no-pr] [--memory-from RUN]; reset.py resets the target
 evergreen/schema.py     shared dataclasses (Failure, TestRun, Rule, Evidence, PatchResult)
 evergreen/loop.py       main ratchet loop            evergreen/testrun.py   pytest + JUnit parsing
 evergreen/patcher.py    line-edit patches            evergreen/guards.py    patch guard + tests hash

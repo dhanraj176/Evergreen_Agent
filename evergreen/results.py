@@ -44,6 +44,17 @@ def totals_line(st) -> str:
             f"{sum(e['commits'] for e in st.files)} fix commits, {st.seconds:.0f}s total")
 
 
+def timing(st) -> dict:
+    """Where the run's time went: the model, pytest, the golden check, the baseline, the rest."""
+    attempts = [a for e in st.files for a in e["attempts"]]
+    t = {"total_s": st.seconds, "baseline_s": st.baseline_s,
+         "llm_s": sum(a.get("patch_s", 0) for a in attempts if a.get("llm", 1)),
+         "tests_s": sum(a.get("tests_s", 0) for a in attempts),
+         "golden_s": sum(a.get("golden_s", 0) for a in attempts)}
+    t["other_s"] = t["total_s"] - sum(v for k, v in t.items() if k != "total_s")
+    return {k: round(v, 1) for k, v in t.items()}
+
+
 def _rule(r) -> dict:
     return {**asdict(r), "confidence": round(confidence(r), 2)}
 
@@ -54,7 +65,8 @@ def write_summary(st) -> str:
     data = {
         "run_id": st.run_id, "mode": st.mode, "repo": st.repo.name, "branch": st.branch,
         "library": st.proven_on, "started_at": int(st.started), "duration_s": round(st.seconds, 1),
-        "pr_url": st.pr_url, "notes": st.notes,
+        "pr_url": st.pr_url, "notes": st.notes, "memory_from": st.memory_from,
+        "timing": timing(st),
         "tests": {"before": {"passing": st.start_passing, "total": st.start_total},
                   "after": {"passing": len(st.tests.passing), "total": st.total}},
         "counters": dict(st.dash.counts),
@@ -92,6 +104,7 @@ def pr_body(st) -> str:
         "previously passing test still passed, at least one more test passed, the tests were untouched, and "
         "the outputs still matched pandas 1.5 (golden check). Each kept fix is its own commit.",
         "",
+        *([f"It started with the verified rules of run `{st.memory_from}` (warm start).", ""] if st.memory_from else []),
         f"**Tests:** {st.start_passing}/{st.start_total} → {len(st.tests.passing)}/{st.total} passing · "
         f"**Attempts:** {len(attempts)} ({sum(_mode(a) == 'instant' for a in attempts)} instant, "
         f"{sum(_mode(a) == 'fast' for a in attempts)} fast, {sum(a['think'] for a in attempts)} thinking) · "
