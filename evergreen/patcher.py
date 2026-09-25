@@ -1,4 +1,6 @@
-"""P1: whole-file patch via the LLM API set by LLM_PROVIDER / LLM_MODEL, forced submit_patch tool."""
+"""P1: line-edit patches. LLM_PROVIDER picks the model: liquid (default, LFM2.5-8B-A1B on
+PATCH_SERVER_URL, JSON-schema constrained) | openai | anthropic. Edits are applied here; patch()
+returns the full new source."""
 from evergreen.schema import PatchResult
 
 

@@ -6,8 +6,15 @@ sourced, versioned rule, written into the target's AGENTS.md and opened as a PR.
 The plan is docs/BRIEF.md (gitignored). Read it in full before a new phase.
 
 ## Decisions that override the brief
-- No AWS Bedrock. Patches come from the LLM API set by `LLM_PROVIDER` (openai | anthropic) and `LLM_MODEL` in .env.
-- Sponsor tools: Liquid (LFM2.5 on llama-server), Nimble, RawTree.
+- No AWS Bedrock. Patches come from a local Liquid model: `LLM_PROVIDER=liquid` (default) is LFM2.5-8B-A1B on a
+  second llama-server at `PATCH_SERVER_URL` (http://localhost:8081). `openai` and `anthropic` (with `LLM_MODEL`)
+  are optional providers behind the same switch. `LLAMA_SERVER_URL` (LFM2.5-1.2B on 8080) is for rule matching.
+- Patches are line edits, not whole-file rewrites: the model sees the file with line numbers and returns JSON
+  `{edits: [{line_no, new_text}], explanation, new_rule}` (new_rule fields as in brief 23.3), enforced by
+  llama-server's JSON-schema constraint; `new_text` may span several lines. `patch()` applies the edits and still
+  returns the full `new_source`, so the section 20 interface is unchanged.
+  Sampling: temperature 0.2, top_k 80, repeat penalty 1.05.
+- Sponsor tools: Liquid (rule matching and patches), Nimble, RawTree.
 - The section 20 dataclasses live in `evergreen/schema.py`, not types.py (types.py shadows the stdlib module).
 - Demo target is `../sales-report`, a separate repo; its golden script is `golden/golden.py` there.
 - Must run on Windows and macOS:
@@ -23,7 +30,7 @@ The plan is docs/BRIEF.md (gitignored). Read it in full before a new phase.
 run.py                  CLI: --repo --venv --run-id [--no-rules]
 evergreen/schema.py     shared dataclasses (Failure, TestRun, Rule, Evidence, PatchResult)
 evergreen/loop.py       main ratchet loop            evergreen/testrun.py   pytest + JUnit parsing
-evergreen/patcher.py    LLM patch, submit_patch      evergreen/guards.py    patch guard + tests hash
+evergreen/patcher.py    line-edit patches            evergreen/guards.py    patch guard + tests hash
 evergreen/instant.py    zero-token rules             evergreen/gitops.py    snapshot/rollback/commit/PR
 evergreen/liquid.py     llama-server rule matcher    evergreen/evidence.py  Nimble search + snippet
 evergreen/changelog.py  release notes (stretch)      evergreen/memory.py    RawTree log/query + rule cache
