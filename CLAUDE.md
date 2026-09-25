@@ -38,5 +38,5 @@ copy `.env.example` to `.env`. Check: `uv run python run.py --help`.
 - `schema.py` and the section 20 function signatures change only with the user's approval.
 - Never commit `.env` or any key.
 - Never hand-edit `../sales-report`. If a run leaves it dirty, restore it with git.
-- Commit and push to main when a phase's done-check passes.
+- Commit locally after each done-check; never push unless asked.
 - docs/BRIEF.md is the plan.
