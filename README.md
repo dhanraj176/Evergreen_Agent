@@ -2,6 +2,15 @@
 
 Evergreen upgrades a codebase one file at a time and turns every fix it can prove into a rule in the repo's `AGENTS.md`.
 
+## Links
+
+- Live dashboard: https://evergreen-lhah.vercel.app
+- Agent code (this repo): https://github.com/dhanraj176/Evergreen_Agent
+- Dashboard code: https://github.com/Nakul-Shivaraj/Evergreen-LHAH
+- Demo target repo: https://github.com/dhanraj176/sales-report
+- Pull request opened by Evergreen (run test3, 3 to 21/21 tests): https://github.com/dhanraj176/sales-report/pull/3
+- Demo video: VIDEO_URL
+
 ## 1. What Evergreen is
 
 Coding agents start every session knowing nothing about your codebase. Teams patch this with hand-written rules files (`AGENTS.md`, `CLAUDE.md`, Cursor rules), but those files go stale: lessons from today's session never get written down, and when a library changes, old rules quietly become wrong. Meanwhile the library upgrade itself keeps getting postponed, because it's dozens of small, repetitive fixes.
@@ -57,15 +66,15 @@ Each model call sees only the current file, its failures and one rule or snippet
 
 | Tool | What it does in Evergreen | Code |
 |---|---|---|
-| **Liquid** | LFM2.5-1.2B matches each failure to a known rule, with the answer limited by a grammar to the current rule IDs or "unknown". LFM2.5-8B writes every patch, with its output forced into the edit JSON by a JSON-schema constraint. Both run on the laptop through llama-server; no code leaves the machine. | `evergreen/liquid.py` (1.2B matcher), `evergreen/patcher.py` (8B patcher) |
-| **Nimble** | Live web search for errors Evergreen hasn't seen before. A rule may cite only a URL that Nimble actually returned during the run; otherwise it's marked "unsourced". | `evergreen/evidence.py` |
-| **RawTree** | The agent's memory: every attempt, rule event, test count and lookup, as append-only rows over its HTTP API. Rows are also mirrored to `runs/<run_id>.jsonl`, and queries fall back to that file if RawTree can't be reached. | `evergreen/memory.py` |
+| **Liquid** | [LFM2.5-1.2B-Instruct](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct-GGUF) matches each failure to a known rule, with the answer limited by a grammar to the current rule IDs or "unknown". [LFM2.5-8B-A1B](https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-GGUF) writes every patch, with its output forced into the edit JSON by a JSON-schema constraint. Both run on the laptop through llama-server from [llama.cpp](https://github.com/ggml-org/llama.cpp); no code leaves the machine. | `evergreen/liquid.py` (1.2B matcher), `evergreen/patcher.py` (8B patcher) |
+| **Nimble** | Live web search ([Nimble Search API](https://docs.nimbleway.com/nimble-sdk/search-api)) for errors Evergreen hasn't seen before. A rule may cite only a URL that Nimble actually returned during the run; otherwise it's marked "unsourced". | `evergreen/evidence.py` |
+| **RawTree** | The agent's memory, in [RawTree](https://rawtree.com/docs): every attempt, rule event, test count and lookup, as append-only rows over its HTTP API. Rows are also mirrored to `runs/<run_id>.jsonl`, and queries fall back to that file if RawTree can't be reached. | `evergreen/memory.py` |
 
 `LLM_PROVIDER` can also be set to `openai` or `anthropic` (with `LLM_MODEL` and a key) to use a cloud model for patches instead. The default is the local Liquid model.
 
 ## 4. Setup (Windows and macOS)
 
-**Tools:** git, the GitHub CLI, uv and llama.cpp.
+**Tools:** git, the GitHub CLI, uv and [llama.cpp](https://github.com/ggml-org/llama.cpp) (which provides `llama-server`).
 
 ```powershell
 # Windows (PowerShell)
@@ -114,13 +123,13 @@ To check them, run `.venv-old\Scripts\python.exe -m pytest -q` on Windows or `.v
 | `LLM_PROVIDER` | `liquid` (default) |
 | `PATCH_SERVER_URL` | `http://127.0.0.1:8081` (the 8B patch model) |
 | `LLAMA_SERVER_URL` | `http://127.0.0.1:8080` (the 1.2B matcher) |
-| `NIMBLE_API_KEY` | your Nimble key |
-| `RAWTREE_API_KEY`, `RAWTREE_DATABASE` | your RawTree key (`read_write`) and database name, e.g. `evergreen` |
+| `NIMBLE_API_KEY` | your key for the [Nimble Search API](https://docs.nimbleway.com/nimble-sdk/search-api) |
+| `RAWTREE_API_KEY`, `RAWTREE_DATABASE` | your [RawTree](https://rawtree.com/docs) key (`read_write`) and database name, e.g. `evergreen` |
 | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `LLM_MODEL` | only if `LLM_PROVIDER` is `openai` or `anthropic` |
 
 `.env` is in `.gitignore`. Never commit it or paste keys anywhere else. Use `127.0.0.1` rather than `localhost`: on Windows, `localhost` tries IPv6 first and adds about 2 s to every request.
 
-**Start the two Liquid models**, each in its own terminal and left running. The first start downloads the models from Hugging Face.
+**Start the two Liquid models**, each in its own terminal and left running: [LFM2.5-1.2B-Instruct GGUF](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct-GGUF) on port 8080 for rule matching, and [LFM2.5-8B-A1B GGUF](https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-GGUF) on port 8081 for patches. The first start downloads them from Hugging Face.
 
 ```bash
 llama-server -hf LiquidAI/LFM2.5-1.2B-Instruct-GGUF:Q4_K_M --host 127.0.0.1 --port 8080 -c 8192
@@ -141,7 +150,15 @@ This checks that `sales-report` has no uncommitted changes and creates the branc
 
 - `--no-pr` commits locally but doesn't push or open a PR.
 - `--no-rules` is the ablation run: every error is treated as new, so each file looks its errors up again and no rule is reused.
-- `--memory-from <run_id>` is a warm start: the run begins with that run's verified and trusted rules (from RawTree, or `runs/<run_id>/` locally), so known errors skip the web lookup and are fixed instantly or in fast mode. Every guard, the ratchet and the golden check still apply.
+- `--memory-from <run_id>`: warm start (below).
+
+**Warm start.** `--memory-from <run_id>` begins the run with that run's final rulebook: the latest event of every rule that ended verified or trusted, read from RawTree (or from `runs/<run_id>/` if RawTree can't be reached). Demoted and retired rules are left out. The loaded rules start as trusted and keep their regexes. Each one is logged as a `loaded` rule event naming the source run, and the header shows `memory: N rules from <run_id>`. Known errors then skip the web lookup: they're fixed instantly by regex, or in fast mode when the regex doesn't fit the line. Only errors no rule covers go to Nimble and a thinking patch. Every guard, the ratchet and the golden check still apply.
+
+```bash
+uv run python run.py --repo ../sales-report --venv ../sales-report/.venv-new --run-id live2 --memory-from live1
+```
+
+Starting from live1's rules, live2 took 266 s instead of about 9 minutes (see Results).
 
 To rehearse again:
 
@@ -196,13 +213,15 @@ The final panel shows the PR link, or the reason it couldn't open one.
 
 ## 7. Results
 
-All numbers come from real runs on this laptop (Windows 11, both models on llama-server) against sales-report, with 21 tests.
+All numbers come from real runs on this laptop (Windows 11, both models on llama-server) with the same 21 tests. r1 to test3 ran against `sales-report`; live1 and live2 ran against a separate copy of it (`sales-report-demo`).
 
 | Run | Code | Tests | Time | Notes |
 |---|---|---|---|---|
 | r1 | first full loop | 3/21 → 15/21 | 773 s | export.py and summary.py needed a human |
 | r2 | + 4096-token thinking budget, instant rules | 3/21 → 18/21 | 733 s | export.py needed a human; PR opened with the AGENTS.md block |
 | test3 | + instant-first, partial progress, retry feedback | 3/21 → **21/21** | 977 s | no file needed a human; 9 fix commits, then AGENTS.md and the PR |
+| live1 | same loop, from scratch | 3/21 → **21/21** | 529 s (about 9 min) | 11 Nimble lookups, 6 rules learned, 0 human interventions |
+| live2 | warm start: `--memory-from live1` | 3/21 → **21/21** | 266 s | 2 Nimble lookups, 9 instant fixes, 1 new rule, 0 human interventions |
 
 **test3, file by file** (from `runs/test3/summary.json`):
 
@@ -220,6 +239,22 @@ All numbers come from real runs on this laptop (Windows 11, both models on llama
 - **Rule scores.** Six rules were learned, all with a Nimble source. R2 (iteritems, confidence 0.80) and R3 (mean, 0.75) became trusted. R1 (append) was demoted after failing twice in summary.py, and the fix learned there became R4.
 - **Flat prompt.** Evergreen's prompt stayed between 459 and 1,026 tokens per model call. By the last attempt, a chat-style agent carrying its whole history would have been sending **26,750** tokens; Evergreen sent **906**.
 - **Human interventions:** 0.
+
+**live2, file by file** (warm start from live1, from `runs/live2/summary.json`):
+
+| File | Result | Attempts | Seconds | Web lookups | Rules |
+|---|---|---|---|---|---|
+| clean.py | fixed | instant: kept · fast: kept | 16 | 0 | R1 (instant), R3 (fast) |
+| metrics.py | fixed | instant: kept | 5 | 0 | R2 (instant) |
+| report.py | fixed | instant: kept | 5 | 0 | R1, R3 (instant) |
+| export.py | fixed | instant: kept | 4 | 0 | R1, R4 (instant) |
+| summary.py | fixed | instant: kept · fast: kept | 11 | 0 | R2 (instant), R3 (fast) |
+| index_utils.py | fixed | instant: kept · thinking: rolled back, kept | 217 | 2 | R5 (instant); learned R7 |
+
+- **Loaded rules did the work.** The first five files took 41 s together, with no web lookup. That's 9 lines fixed by regex at 0 tokens, plus two fast model calls for `append`, where the regex was tied to one file's variable names.
+- **One uncovered error cost most of the time.** live1 had learned its `Int64Index` fix under an intermediate error, `pandas.NumericIndex`, so the original error had no rule. index_utils.py needed 2 Nimble lookups and two thinking attempts: 217 s of the 266. live2 learned that fix under the original signature, as R7. A run with `--memory-from live2` should skip it too, but we haven't measured that yet.
+- **Where the time went** (`timing` in the summary): 209 s in the model, almost all of it the two thinking attempts; 29 s pytest; 10 s golden check; 8 s baseline; 12 s everything else.
+- **Flat prompt.** The last prompt was 645 tokens; a chat-style agent would have been sending 4,924.
 
 **Why export.py needed a human in r1 and r2, and what we fixed.** The fix is to rename `to_csv(line_terminator=...)` to `lineterminator=`. Instead, the model often deleted the argument, in 2 of 3 samples when we re-ran the same prompt. On Windows that silently switches the CSV to CRLF line endings. The ratchet caught it every time: the golden output no longer matched, and the line-ending test kept failing. But Evergreen's retry message only said "golden mismatch", so the model repeated the same mistake. In r1, three thinking answers, one of them in export.py, were also cut off mid-JSON by a 2048-token limit. We fixed our side:
 
