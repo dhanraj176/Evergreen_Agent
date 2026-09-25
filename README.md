@@ -137,7 +137,7 @@ From the Evergreen folder (the same commands work in PowerShell and on macOS):
 uv run python run.py --repo ../sales-report --venv ../sales-report/.venv-new --run-id demo1
 ```
 
-This checks that `sales-report` has no uncommitted changes and creates the branch `evergreen/pandas-2`. It then fixes the files one by one, committing each kept patch. At the end it commits the `AGENTS.md` block, pushes the branch, opens the PR, writes `runs/demo1/summary.json`, and prints a summary table with seconds per file and the mode of every attempt. Expect about 10–13 minutes on a laptop; most of that is the 8B model thinking.
+This checks that `sales-report` has no uncommitted changes and creates the branch `evergreen/pandas-2`. It then fixes the files one by one, committing each kept patch. At the end it commits the `AGENTS.md` block, pushes the branch, opens the PR, writes `runs/demo1/summary.json`, and prints a summary table with seconds per file and the mode of every attempt. Expect about 12–16 minutes on a laptop (r2: 12, test3: 16); most of that is the 8B model thinking.
 
 - `--no-pr` commits locally but doesn't push or open a PR.
 - `--no-rules` is the ablation run: every error is treated as new, so each file looks its errors up again and no rule is reused.
@@ -200,29 +200,43 @@ All numbers come from real runs on this laptop (Windows 11, both models on llama
 | Run | Code | Tests | Time | Notes |
 |---|---|---|---|---|
 | r1 | first full loop | 3/21 → 15/21 | 773 s | export.py and summary.py needed a human |
-| r2 | + 4096-token thinking budget, instant rules | 3/21 → **18/21** | 733 s | export.py needed a human; PR opened with the AGENTS.md block |
-| test3 | + instant-first, partial progress, retry feedback | *running when this was written; see the update below* | | |
+| r2 | + 4096-token thinking budget, instant rules | 3/21 → 18/21 | 733 s | export.py needed a human; PR opened with the AGENTS.md block |
+| test3 | + instant-first, partial progress, retry feedback | 3/21 → **21/21** | 977 s | no file needed a human; 9 fix commits, then AGENTS.md and the PR |
 
-**r2, file by file:**
+**test3, file by file** (from `runs/test3/summary.json`):
 
 | File | Result | Attempts | Seconds | Web lookups | Rules |
 |---|---|---|---|---|---|
-| clean.py | fixed | thinking: guard, guard, kept | 170 | 2 | learned R1, R2 |
-| metrics.py | fixed | thinking: rolled back, kept | 109 | 1 | learned R3 |
-| report.py | fixed | fast: kept | 10 | 0 | reused R1, R2 (R2 instant) |
-| export.py | needs a human | thinking: rolled back ×3 | 196 | 1 | reused R2 |
-| summary.py | fixed | fast: rolled back; thinking: rolled back, kept | 186 | 1 | reused R1, R3; learned R4 |
-| index_utils.py | fixed | thinking: kept | 63 | 2 | learned R5 |
+| clean.py | fixed | thinking: kept | 52 | 2 | learned R1, R2 |
+| metrics.py | fixed | thinking: kept | 51 | 1 | learned R3 |
+| report.py | fixed | instant: kept · fast: kept | 12 | 0 | reused R2 (instant) and R1 |
+| export.py | fixed | instant: kept · thinking: guard, guard, kept | 202 | 2 | reused R2 (instant) |
+| summary.py | fixed | instant: kept · fast: rolled back · thinking: rolled back, kept | 210 | 1 | reused R3 (instant) and R1; learned R4 |
+| index_utils.py | fixed | thinking: guard, guard, kept | 450 | 2 | learned R5, R6 |
 
-In r2, report.py, the first file where only known rules were needed, took 10 s with no web lookup. The prompt stayed flat, at 459–1,080 tokens per attempt. By the last attempt a chat-style agent would have been sending **24,051** tokens; Evergreen sent **787**.
+- **Rules reused.** The first two files cost web lookups and thinking-mode patches. report.py, the first file that needed only known rules, took 12 s with no web lookup: R2 was applied by regex, then R1 in fast mode.
+- **Instant fixes.** There were three (report.py, export.py and summary.py), each kept by the ratchet, 3–5 s each, with 0 tokens.
+- **Rule scores.** Six rules were learned, all with a Nimble source. R2 (iteritems, confidence 0.80) and R3 (mean, 0.75) became trusted. R1 (append) was demoted after failing twice in summary.py, and the fix learned there became R4.
+- **Flat prompt.** Evergreen's prompt stayed between 459 and 1,026 tokens per model call. By the last attempt, a chat-style agent carrying its whole history would have been sending **26,750** tokens; Evergreen sent **906**.
+- **Human interventions:** 0.
 
-**Why export.py needed a human in r1 and r2, and what we fixed.** The fix is to rename `to_csv(line_terminator=...)` to `lineterminator=`. Instead, the model often deleted the argument, in 2 of 3 samples when we re-ran the same prompt. On Windows that silently switches the CSV to `\r\n` line endings. The ratchet caught it every time: the golden output no longer matched, and the line-ending test kept failing. But Evergreen's retry message only said "golden mismatch", so the model repeated the same mistake. In r1, three thinking answers, one of them in export.py, were also cut off mid-JSON by a 2048-token limit. We fixed our side:
+**Why export.py needed a human in r1 and r2, and what we fixed.** The fix is to rename `to_csv(line_terminator=...)` to `lineterminator=`. Instead, the model often deleted the argument, in 2 of 3 samples when we re-ran the same prompt. On Windows that silently switches the CSV to CRLF line endings. The ratchet caught it every time: the golden output no longer matched, and the line-ending test kept failing. But Evergreen's retry message only said "golden mismatch", so the model repeated the same mistake. In r1, three thinking answers, one of them in export.py, were also cut off mid-JSON by a 2048-token limit. We fixed our side:
 
 - the thinking budget is now 4096 tokens;
 - retries are told exactly what the rejected patch changed and which tests still fail;
 - known rules are applied instantly first and committed on their own, so the model only sees the remaining error;
 - the ratchet keeps partial progress instead of demanding a whole file at once;
 - the patcher keeps a replaced line's indentation, which the model often shifted.
+
+In test3, export.py was fixed in two rounds. The iteritems rule applied instantly, then the model fixed `line_terminator` on its third attempt.
+
+**What still goes wrong.** In test3 the guard refused four patches before they ran:
+
+- twice in export.py, a mangled `"\n"` escape that no longer parsed;
+- once in index_utils.py, a diff marker (`-`) pasted into the code;
+- once in index_utils.py, a patch that deleted a function.
+
+None of them reached the code, but these retries are most of the run time: index_utils.py alone took 7.5 minutes of thinking.
 
 ## 8. Safety and honest limits
 
@@ -232,7 +246,7 @@ In r2, report.py, the first file where only known rules were needed, took 10 s w
 - **Rules are earned.** They are born only from kept patches, used only on the same error signature, scored by outcome, and demoted after two failures in a row.
 - **A human reviews everything.** Evergreen never merges: it opens a PR with one commit per kept fix.
 
-Evergreen can only verify what the tests and golden outputs cover; weak tests mean weaker guarantees, which is why the PR is there. A full run takes about 10–13 minutes on a laptop, mostly the 8B model thinking. The local model sometimes aims an edit at the wrong line or drops an argument. The guard and ratchet catch those, but they cost retries, and a file can still end up as "needs a human".
+Evergreen can only verify what the tests and golden outputs cover; weak tests mean weaker guarantees, which is why the PR is there. A full run takes about 12–16 minutes on a laptop, mostly the 8B model thinking. The local model sometimes aims an edit at the wrong line or drops an argument. The guard and ratchet catch those, but they cost retries, and a file can still end up as "needs a human".
 
 ## 9. Project layout
 
