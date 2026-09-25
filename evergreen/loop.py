@@ -23,7 +23,7 @@ from evergreen.gitops import BRANCH, commit_file, create_branch, git, open_pr, p
 from evergreen.golden import golden_broken, golden_ok
 from evergreen.guards import patch_ok, tests_hash
 from evergreen.instant import apply_instant
-from evergreen.memory import flush, log, save_rule_event, trusted
+from evergreen.memory import flush, log, log_patch, log_tests, save_rule_event, trusted
 from evergreen.patcher import patch
 from evergreen.schema import Failure, PatchResult, Rule, TestRun
 from evergreen.testrun import run_tests, venv_python
@@ -33,6 +33,7 @@ MAX_ATTEMPTS = 3          # per round
 MAX_ROUNDS = 4            # accepted patches per file (instant-first adds one) before it counts as stuck
 DEMOTE_AFTER = 2          # failures in a row
 MAX_FEEDBACK = 8          # failure lines fed back on a retry
+FIXER = {"instant": "liquid_quick", "fast": "liquid_fast", "think": "liquid_think"}   # attempts.fixer, as the dashboard names it
 
 
 @dataclass
@@ -55,6 +56,7 @@ class State:
     fails_in_a_row: dict[str, int] = field(default_factory=dict)
     attempt_no: int = 0
     history_tokens: int = 0       # prompt + output of every earlier attempt (section 10)
+    suite: int = 0                # full test-suite runs so far (test_results.suite)
     needs_human: list[str] = field(default_factory=list)
     files: list[dict] = field(default_factory=list)
     timeline: list[dict] = field(default_factory=list)
@@ -84,6 +86,7 @@ def run(repo: str, venv: str, run_id: str, use_rules: bool = True, files: list[s
         st = State(repo, venv, run_id, use_rules, dash, _library_version(venv), tests_hash(repo),
                    tests, golden_ok(repo, venv), len(tests.passing), _total(tests))
         _log_suite(st, None)
+        _log_tests(st, tests, None, None, kept=True)
         dash.update(tests_passing=len(tests.passing), tests_total=_total(tests))
         dash.log(f"baseline: {len(tests.passing)}/{_total(tests)} passing on {st.proven_on}")
         for src in _file_order(st, files):
@@ -177,7 +180,8 @@ def _fix_round(st: State, src: str, failures: list[Failure], entry: dict) -> boo
         row = {"run_id": st.run_id, "mode": st.mode, "attempt": st.attempt_no, "file": name,
                "file_attempt": attempt, "signatures": sorted({f.signature for f in s_fail}),
                "rule_ids": [r.rule_id for r in used], "used_web": int(lookups > 0), "web_lookups": lookups,
-               "think": int(think), "llm": int(not instant), "instant": instant_lines, "accepted": 0,
+               "think": int(think), "llm": int(not instant), "instant": int(bool(instant)),
+               "instant_lines": instant_lines, "fixer": FIXER[mode], "accepted": 0,
                "rolled_back": 0, "rejected_by_guard": 0, "prompt_tokens": 0, "naive_prompt_tokens": 0,
                "output_tokens": 0}
 
@@ -225,13 +229,16 @@ def _fix_round(st: State, src: str, failures: list[Failure], entry: dict) -> boo
             if not accepted:
                 restore(path, original)            # roll back
         _rule_outcomes(st, s_fail, s_hint, after, accepted)
+        _log_tests(st, after, name, st.attempt_no, kept=accepted)
         row["after_passing"] = len(after.passing)
 
         if accepted:
             learned = _learn(st, res, s_fail, after)
             ids = [r.rule_id for r in used] + [r.rule_id for r in learned]
-            commit_file(st.repo, src, f"ratchet: fix {name}" + (f" ({', '.join(ids)})" if ids else "")
-                        + (" [instant, 0 tokens]" if instant else ""))
+            sha = commit_file(st.repo, src, f"ratchet: fix {name}" + (f" ({', '.join(ids)})" if ids else "")
+                              + (" [instant, 0 tokens]" if instant else ""))
+            log_patch(st.run_id, st.attempt_no, name, sha, {"think": "thinking"}.get(mode, mode), ids,
+                      git(st.repo, "show", "--format=", "--no-color", sha))
             st.tests, st.golden = after, gold
             entry["learned"] += [r.rule_id for r in learned]
             entry["commits"] += 1
@@ -272,7 +279,7 @@ def _hints(st: State, name: str, failures: list[Failure], looked_up: dict) -> tu
         if f.signature not in looked_up:
             ev = looked_up[f.signature] = evidence.get_evidence(f)
             lookups += 1
-            log("evidence", {"run_id": st.run_id, "file": name, "signature": f.signature,
+            log("evidence", {"run_id": st.run_id, "file": name, "signature": f.signature, "cached": 0,
                              **evidence.last_lookup})
             if ev:
                 st.dash.nimble(ev.url, f"{ev.latency_s:.1f}s")
@@ -429,6 +436,11 @@ def _log_suite(st: State, name: str | None) -> None:
     log("test_runs", row)
     st.timeline.append({"t": round(time.time() - st.started, 1), "file": name,
                         "passing": row["passing"], "total": row["total"]})
+
+
+def _log_tests(st: State, tests: TestRun, name: str | None, attempt: int | None, kept: bool) -> None:
+    st.suite += 1
+    log_tests(st.run_id, tests, st.suite, attempt, name, kept)
 
 
 def _failures_in(tests: TestRun, src: str) -> list[Failure]:

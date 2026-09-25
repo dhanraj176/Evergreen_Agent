@@ -3,10 +3,17 @@
 log(table, row) appends the row to runs/<run_id>.jsonl at once and queues it for RawTree; a daemon
 thread inserts queued rows in batches every ~2 s. flush() forces that and runs at exit.
 Each JSONL line is {"_table": <table>, **row}; rows without a run_id go to runs/_misc.jsonl.
+Every row gets `at` (epoch seconds) and `seq` (order within the process), which the team
+dashboard (github.com/Nakul-Shivaraj/Evergreen-LHAH, dashboard/) sorts by.
 query(sql) asks RawTree, and falls back to running the SQL over the JSONL (in-memory sqlite)
 when there is no key or RawTree fails. Nothing here raises on RawTree trouble.
+
+Tables: attempts, rule_events, test_runs, evidence (read by the dashboard), matches, and
+  patches       one row per accepted patch: file, commit_sha, mode, rule_ids, unified diff
+  test_results  one row per test per suite run: suite, attempt, kept, test_id, status, failure
 """
 import atexit
+import itertools
 import json
 import os
 import queue
@@ -19,13 +26,14 @@ from pathlib import Path
 
 import requests
 
-from evergreen.schema import Rule
+from evergreen.schema import Rule, TestRun
 
 API = "https://api.rawtree.com"
 RUNS = Path(__file__).resolve().parent.parent / "runs"
 MISC_RUN = "_misc"
 stats = {"inserted": 0, "insert_errors": 0, "last_error": None}
 
+_seq = itertools.count(1)
 _q = queue.Queue()
 _pending: dict[str, list[dict]] = {}     # rows whose insert failed; retried on the next flush
 _flush_lock = threading.Lock()
@@ -59,6 +67,7 @@ def _run_file(run_id) -> Path:
 def log(table: str, row: dict) -> None:
     row = {**row}
     row.setdefault("at", int(time.time()))
+    row.setdefault("seq", next(_seq))
     RUNS.mkdir(parents=True, exist_ok=True)
     with _file_lock, open(_run_file(row.get("run_id") or MISC_RUN), "a",
                           encoding="utf-8", newline="\n") as fh:
@@ -170,6 +179,25 @@ def _cell(v):
     if isinstance(v, (list, dict)):
         return _dumps(v)
     return int(v) if isinstance(v, bool) else v
+
+
+def log_patch(run_id: str, attempt: int, file: str, commit_sha: str, mode: str, rule_ids: list[str],
+              diff: str, **extra) -> None:
+    """An accepted patch. mode: instant | fast | thinking. diff: the commit's unified diff."""
+    log("patches", {"run_id": run_id, "attempt": attempt, "file": file, "commit_sha": commit_sha,
+                    "mode": mode, "rule_ids": rule_ids, "diff": diff, **extra})
+
+
+def log_tests(run_id: str, tests: TestRun, suite: int, attempt: int | None, file: str | None,
+              kept: bool, **extra) -> None:
+    """One test_results row per test of one suite run. kept: this run became the branch's state."""
+    base = {"run_id": run_id, "suite": suite, "attempt": attempt, "file": file, "kept": int(kept), **extra}
+    for test_id in sorted(tests.passing):
+        log("test_results", {**base, "test_id": test_id, "status": "passed"})
+    for f in tests.failing:
+        log("test_results", {**base, "test_id": f.test_id, "status": "failed", "exc_type": f.exc_type,
+                             "signature": f.signature, "message": f.message, "src_file": f.src_file,
+                             "line_no": f.line_no})
 
 
 def _rules_file() -> Path:
